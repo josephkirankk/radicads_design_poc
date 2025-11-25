@@ -20,9 +20,11 @@ class LayoutAI:
     def __init__(self):
         """Initialize Gemini client with API key from settings."""
         try:
-            # Debug: Log API key info
+            # Initialize client with API key from settings
             api_key = settings.GEMINI_API_KEY
-            logger.info(f"API Key (first 10 chars): {api_key[:10]}... (length: {len(api_key)})")
+            if not api_key:
+                raise ValueError("GEMINI_API_KEY not configured in settings")
+            logger.info(f"API Key configured (length: {len(api_key)})")
 
             self.client = genai.Client(api_key=api_key)
             self.model_name = settings.GEMINI_MODEL_NAME
@@ -32,11 +34,20 @@ class LayoutAI:
                 f"Initialized LayoutAI with model={self.model_name}, "
                 f"timeout={self.timeout}s, max_retries={self.max_retries}"
             )
-            logger.info(f"Client initialized successfully: {self.client is not None}")
+            logger.info(
+                f"Client initialized successfully: {self.client is not None}"
+            )
         except Exception as e:
-            logger.error(f"Failed to initialize Gemini client: {str(e)}")
+            logger.error(
+                f"Failed to initialize Gemini client: "
+                f"{type(e).__name__}: {str(e)}"
+            )
             logger.warning("Will fall back to mock data for all requests")
             self.client = None
+            import traceback
+            logger.debug(
+                f"Initialization error traceback: {traceback.format_exc()}"
+            )
 
     async def prompt_to_brief(self, prompt: str) -> Dict[str, Any]:
         """
@@ -51,16 +62,19 @@ class LayoutAI:
         Returns:
             Design brief as dict with headline, subheadline, colors, etc.
         """
-        logger.info(f"=== prompt_to_brief START === Client is None: {self.client is None}")
         if not self.client:
             logger.warning("Client not initialized, using mock brief")
             return create_mock_design_brief()
 
-        logger.info(f"Client is initialized, proceeding with API call. Client type: {type(self.client)}")
+        logger.info(
+            f"Generating design brief from prompt "
+            f"(length: {len(prompt)} chars)"
+        )
         
         # Enhance prompt with instructions for better results
         enhanced_prompt = f"""
-You are a professional graphic designer. Analyze the following design request and create a structured design brief.
+You are a professional graphic designer. Analyze the following design request
+and create a structured design brief.
 
 Design Request: {prompt}
 
@@ -72,61 +86,95 @@ Create a design brief that includes:
 - Color scheme with primary, secondary, and accent colors (provide hex codes)
 - Appropriate format (instagram_post, instagram_story, etc.)
 
-Consider design principles like visual hierarchy, color theory, and target audience appeal.
+Consider design principles like visual hierarchy, color theory, and target
+audience appeal.
 """
         
         for attempt in range(self.max_retries):
+            response = None
             try:
-                logger.info(f"=== ATTEMPT {attempt + 1}/{self.max_retries} ===")
-                logger.info(f"Using model: {self.model_name}")
-                logger.info(f"About to call self.client.aio.models.generate_content...")
-                
-                # Use async generate_content with structured output
-                response = await self.client.aio.models.generate_content(
-                    model=self.model_name,
-                    contents=enhanced_prompt,
-                    config={
-                        "response_mime_type": "application/json",
-                        "response_json_schema": DesignBrief.model_json_schema(),
-                    }
+                logger.info(
+                    f"Attempt {attempt + 1}/{self.max_retries}: "
+                    f"Generating brief with {self.model_name}"
                 )
                 
-                logger.info(f"=== RECEIVED RESPONSE ===")
-                logger.info(f"Response type: {type(response)}")
-                logger.info(f"Response text (first 200 chars): {response.text[:200]}")
+                schema_config = {
+                    "response_mime_type": "application/json",
+                    "response_json_schema": DesignBrief.model_json_schema(),
+                }
+                
+                # Use async generate_content with structured output and timeout
+                response = await asyncio.wait_for(
+                    self.client.aio.models.generate_content(
+                        model=self.model_name,
+                        contents=enhanced_prompt,
+                        config=schema_config  # type: ignore
+                    ),
+                    timeout=self.timeout
+                )
+                
+                logger.debug(
+                    f"Received response (length: "
+                    f"{len(response.text) if response.text else 0} chars)"
+                )
                 
                 # Validate response using Pydantic
+                if not response.text:
+                    raise ValueError("Empty response from API")
                 brief_obj = DesignBrief.model_validate_json(response.text)
                 brief_dict = brief_obj.model_dump()
                 
                 logger.info(
-                    f"Successfully generated brief: headline='{brief_dict.get('headline')}', "
+                    f"Successfully generated brief: "
+                    f"headline='{brief_dict.get('headline')}', "
                     f"style={brief_dict.get('layout_style')}"
                 )
                 return brief_dict
                 
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON in response (attempt {attempt + 1}): {str(e)}")
-                logger.error(f"Response text: {response.text if 'response' in locals() else 'No response'}")
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"Timeout after {self.timeout}s "
+                    f"(attempt {attempt + 1}/{self.max_retries})"
+                )
                 if attempt < self.max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                    await asyncio.sleep(2 ** attempt)
+                    
+            except json.JSONDecodeError as e:
+                logger.error(
+                    f"Invalid JSON in response "
+                    f"(attempt {attempt + 1}): {str(e)}"
+                )
+                if response and response.text:
+                    logger.error(
+                        f"Response text (first 500 chars): "
+                        f"{response.text[:500]}"
+                    )
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
                     
             except Exception as e:
-                logger.error(f"Error generating brief (attempt {attempt + 1}): {str(e)}")
-                logger.error(f"Error type: {type(e).__name__}")
-                import traceback
-                logger.error(f"Traceback: {traceback.format_exc()}")
+                logger.error(
+                    f"Error generating brief (attempt {attempt + 1}): "
+                    f"{type(e).__name__}: {str(e)}"
+                )
                 if attempt < self.max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                    logger.debug(f"Will retry after {2 ** attempt}s backoff")
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    import traceback
+                    logger.error(
+                        f"Final attempt failed. "
+                        f"Traceback: {traceback.format_exc()}"
+                    )
         
         # Fallback to mock data after all retries exhausted
         logger.warning("All attempts failed, falling back to mock brief")
         return create_mock_design_brief()
 
     async def brief_to_design(
-        self, 
-        brief: Dict[str, Any], 
-        brand_id: str = None
+        self,
+        brief: Dict[str, Any],
+        brand_id: str | None = None
     ) -> Dict[str, Any]:
         """
         Generate Fabric.js compatible design JSON from brief.
@@ -146,7 +194,9 @@ Consider design principles like visual hierarchy, color theory, and target audie
             return create_mock_fabric_design(brief)
         
         # Get canvas dimensions for the format
-        dimensions = get_fabric_canvas_dimensions(brief.get("format", "instagram_post"))
+        dimensions = get_fabric_canvas_dimensions(
+            brief.get("format", "instagram_post")
+        )
         
         # Build detailed prompt for Fabric.js generation
         design_prompt = f"""
@@ -169,30 +219,43 @@ Create a Fabric.js JSON design that:
 3. Includes the headline and subheadline as text objects
 4. Adds 2-3 decorative shape objects (rectangles, circles) for visual interest
 5. Follows proper Fabric.js object structure
-6. Uses coordinates within the canvas bounds (0 to {dimensions['width']} width, 0 to {dimensions['height']} height)
+6. Uses coordinates within the canvas bounds
+   (0 to {dimensions['width']} width, 0 to {dimensions['height']} height)
 
 Fabric.js Object Structure Requirements:
-- Each text object needs: type, left, top, width, height, text, fontSize, fontFamily, fontWeight, fill, textAlign, originX, originY
-- Each shape object needs: type, left, top, width/height or radius, fill, stroke, strokeWidth, opacity
-- The root object needs: version (5.3.0), objects (array), background (hex color)
+- Each text object needs: type, left, top, width, height, text, fontSize,
+  fontFamily, fontWeight, fill, textAlign, originX, originY
+- Each shape object needs: type, left, top, width/height or radius, fill,
+  stroke, strokeWidth, opacity
+- The root object needs: version (5.3.0), objects (array),
+  background (hex color)
 
 Make the design visually appealing and professionally laid out.
 """
 
         for attempt in range(self.max_retries):
+            response = None
             try:
-                logger.info(f"Generating design (attempt {attempt + 1}/{self.max_retries})")
+                logger.info(
+                    f"Attempt {attempt + 1}/{self.max_retries}: "
+                    f"Generating design with {self.model_name}"
+                )
                 
-                # Use JSON mode for free-form Fabric.js structure
-                response = await self.client.aio.models.generate_content(
-                    model=self.model_name,
-                    contents=design_prompt,
-                    config={
-                        "response_mime_type": "application/json",
-                    }
+                # Use JSON mode for free-form Fabric.js structure with timeout
+                response = await asyncio.wait_for(
+                    self.client.aio.models.generate_content(
+                        model=self.model_name,
+                        contents=design_prompt,
+                        config={
+                            "response_mime_type": "application/json",
+                        }
+                    ),
+                    timeout=self.timeout
                 )
                 
                 # Parse and validate the JSON
+                if not response.text:
+                    raise ValueError("Empty response from API")
                 design_json = json.loads(response.text)
                 
                 # Post-process: Ensure required fields
@@ -205,32 +268,59 @@ Make the design visually appealing and professionally laid out.
                 
                 # Validate coordinates are within bounds
                 design_json = self._validate_and_fix_coordinates(
-                    design_json, 
-                    dimensions['width'], 
+                    design_json,
+                    dimensions['width'],
                     dimensions['height']
                 )
                 
                 logger.info(
-                    f"Successfully generated design with {len(design_json.get('objects', []))} objects"
+                    f"Successfully generated design with "
+                    f"{len(design_json.get('objects', []))} objects"
                 )
                 return design_json
                 
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"Timeout after {self.timeout}s "
+                    f"(attempt {attempt + 1}/{self.max_retries})"
+                )
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    
             except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON in design response (attempt {attempt + 1}): {str(e)}")
+                logger.error(
+                    f"Invalid JSON in design response "
+                    f"(attempt {attempt + 1}): {str(e)}"
+                )
+                if response and response.text:
+                    logger.error(
+                        f"Response text (first 500 chars): "
+                        f"{response.text[:500]}"
+                    )
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(2 ** attempt)
                     
             except Exception as e:
-                logger.error(f"Error generating design (attempt {attempt + 1}): {str(e)}")
+                logger.error(
+                    f"Error generating design (attempt {attempt + 1}): "
+                    f"{type(e).__name__}: {str(e)}"
+                )
                 if attempt < self.max_retries - 1:
+                    logger.debug(f"Will retry after {2 ** attempt}s backoff")
                     await asyncio.sleep(2 ** attempt)
+                else:
+                    import traceback
+                    logger.error(
+                        f"Final attempt failed. "
+                        f"Traceback: {traceback.format_exc()}"
+                    )
         
         # Fallback to mock design after all retries exhausted
         logger.warning("All attempts failed, falling back to mock design")
         return create_mock_fabric_design(brief)
 
     def _validate_and_fix_coordinates(
-        self, 
+        self,
         design: Dict[str, Any],
         max_width: int,
         max_height: int
@@ -258,8 +348,9 @@ Make the design visually appealing and professionally laid out.
                 obj["width"] = max_width * 0.8
             if "height" in obj and obj["height"] > max_height:
                 obj["height"] = max_height * 0.8
-            if "radius" in obj and obj["radius"] > min(max_width, max_height) / 2:
-                obj["radius"] = min(max_width, max_height) / 4
+            min_dimension = min(max_width, max_height)
+            if "radius" in obj and obj["radius"] > min_dimension / 2:
+                obj["radius"] = min_dimension / 4
         
         return design
 
