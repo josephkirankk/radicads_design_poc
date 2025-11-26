@@ -17,6 +17,7 @@ dependencies = [
     "pydantic-settings>=2.12.0",
     "python-dotenv>=1.2.1",
     "email-validator>=2.3.0",
+    "replicate>=0.25.0",  # Replicate API for running AI models
 ]
 
 [tool.uv]

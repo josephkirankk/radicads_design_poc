@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     GEMINI_TIMEOUT: int = 30  # Request timeout in seconds
     GEMINI_MAX_RETRIES: int = 3  # Retry attempts for transient failures
 
+    # AI - Replicate Configuration
+    REPLICATE_API_TOKEN: str = ""  # Replicate API token from replicate.com/account/api-tokens
+    REPLICATE_TIMEOUT: int = 300  # Request timeout in seconds (5 minutes for long-running models)
+    REPLICATE_MAX_RETRIES: int = 3  # Retry attempts for transient failures
+    REPLICATE_POLL_INTERVAL: float = 0.5  # Polling interval in seconds for prediction status
+
     # Environment
     ENVIRONMENT: str = "development"
     LOG_LEVEL: str = "INFO"
